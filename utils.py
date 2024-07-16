@@ -1,15 +1,38 @@
+import gc
+import glob
+import math
 import os
-import sys
-import logging
-import datetime
+import pickle
+from datetime import datetime
+from functools import partial
+from multiprocessing import Manager, Pool
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
+import scipy.io
+# import shapely
+from dateutil import parser
+# from geopack import geopack, t89
+from matplotlib.cm import ScalarMappable
+from matplotlib.collections import PatchCollection
+from matplotlib.colors import Normalize
+from matplotlib.patches import Circle, Wedge
+from sklearn.feature_selection import mutual_info_regression
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, StandardScaler
+from spacepy import pycdf
+from tqdm import tqdm
 
-import scipy.stats as stats
-import matplotlib.pyplot as plt
+pd.options.mode.chained_assignment = None
 
+os.environ["CDF_LIB"] = "~/CDF/lib"
 
+data_dir = '../../../../data/'
+twins_dir = '../data/twins/'
+supermag_dir = data_dir+'supermag/feather_files/'
+regions_dict = data_dir+'mike_working_dir/identifying_regions_data/adjusted_regions.pkl'
+regions_stat_dict = data_dir+'mike_working_dir/identifying_regions_data/twins_era_stats_dict_radius_regions_min_2.pkl'
 
 def loading_solarwind(source='ace', limit_to_twins=False):
 	'''
@@ -270,3 +293,188 @@ class RegionPreprocessing():
 			pickle.dump(self.clusters, f)
 
 		return regional_df
+
+
+class MI():
+
+	def __init__(self, **kwargs):
+
+		self.__dict__.update(kwargs)
+
+	def binning(self, arrs):
+		'''
+		Bins the data using the method proposed by Sturges (1926). Assumes a normal
+		distribution. Obviously not usually the reality so we check to see how many
+		empty bins there are and lower the bin count if there are too many.
+
+		Args:
+			X (np.array): array of the first feature
+			Y (np.array): array of the second feature
+
+		Returns:
+			X_bins (np.array): binned array of the first feature
+			Y_bins (np.array): binned array of the second feature
+		'''
+		n_bins = int(math.log2(len(arrs[0])) + 1)
+
+		binned_arrs = []
+		# getting the histograms and normalizing them to PDFs
+		for arr in arrs:
+			binned_arr, __ = np.histogram(arr, bins=n_bins, density=True)
+			binned_arrs.append(binned_arr)
+
+		# checking to see if the percentage of empty bins is too high
+		empty_bins = []
+		for arr in binned_arrs:
+			empty_bins.append(len(arr[arr == 0]) / len(arr))
+		while any([empty_bin > 0.15 for empty_bin in empty_bins]):
+			binned_arrs = []
+			print(f'Too many empty bins. Reducing bin count to {n_bins}')
+			n_bins -= int(n_bins * 0.15)
+			for arr in arrs:
+				binned_arr, __ = np.histogram(arr, bins=n_bins, density=True)
+				binned_arrs.append(binned_arr)
+
+			print(f'Empty bins: {empty_bins}')
+
+			empty_bins = []
+			for arr in binned_arrs:
+				empty_bins.append(len(arr[arr == 0]) / len(arr))
+
+
+		return tuple(binned_arrs)
+
+
+
+	def mutual_information(self, X, Y, random_state=42):
+		'''
+		Calculates the mutual information between two features
+
+		Returns:
+			mi (float): mutual information between the two features
+		'''
+
+
+		X = self.X
+		Y = self.Y
+
+		X, Y = self.binning([X, Y])
+
+		# calculating the mutual information
+		mi = mutual_info_regression(X, Y, random_state=random_state, n_neighbors=3, n_jobs=-1)
+
+		return mi
+
+
+	def make_noise(self, n_samples, random_state=42):
+		'''
+		Creates a random array of noise to compare the mutual information to
+
+		Returns:
+			noise (np.array): array of random noise
+		'''
+
+		noise = np.random.normal(0, 1, n_samples)
+
+		return noise
+
+
+def entropy(X):
+
+	'''
+	Calculates the entropy of a feature
+
+	Returns:
+		entropy (float): entropy of the feature
+	'''
+
+	n_bins = int(np.log2(len(X)) + 1)
+
+	binned_dist = np.histogram(X, bins=n_bins)[0]
+
+	# normalizing
+	probs = binned_dist / np.sum(binned_dist)
+
+	# removing zeros
+	probs = probs[np.nonzero(probs)]
+
+	# calculating the entropy
+	entropy = -np.sum(probs * np.log2(probs))
+
+	return entropy
+
+
+def joint_entropy(X, Y):
+	'''
+	Calculates the joint entropy between two features
+
+	Returns:
+		je (float): joint entropy between the two features
+	'''
+	n_bins = max(int(np.log2(X.shape[0]) + 1), int(np.log2(Y.shape[0]) + 1))
+
+	binned_dist = np.histogram2d(X, Y, bins=n_bins)[0]
+
+	# normalizing
+	probs = binned_dist / np.sum(binned_dist)
+
+	# removing zeros
+	probs = probs[np.nonzero(probs)]
+
+	# calculating the joint entropy
+	joint_entropy = -np.sum(probs * np.log2(probs))
+
+	return joint_entropy
+
+
+def triple_entropy(X, Y, Z):
+
+	n_bins = max(int(np.log2(X.shape[0]) + 1), int(np.log2(Y.shape[0]) + 1), int(np.log2(Z.shape[0]) + 1))
+
+	binned_dist = np.histogramdd([X, Y, Z], bins=n_bins)[0]
+
+	# normalizing
+	probs = binned_dist / np.sum(binned_dist)
+
+	# removing zeros
+	probs = probs[np.nonzero(probs)]
+
+	# calculating the joint entropy
+	triple_entropy = -np.sum(probs * np.log2(probs))
+
+	return triple_entropy
+
+
+def mutual_information(X, Y):
+	'''
+	Calculates the mutual information between two features
+
+	Returns:
+		mi (float): mutual information between the two features
+	'''
+
+	H_xy = joint_entropy(X, Y)
+	H_x = entropy(X)
+	H_y = entropy(Y)
+
+	mi = H_x + H_y - H_xy
+
+	return mi
+
+
+def conditional_mutual_inforamtion(X, Y, Z):
+	'''
+	Calculates the conditional mutual information between two features given a third
+
+	Returns:
+		cmi (float): conditional mutual information between the two features given the third
+	'''
+
+	H_xz = joint_entropy(X, Z)
+	H_yz = joint_entropy(Y, Z)
+	H_xyz = triple_entropy(X, Y, Z)
+	H_z = entropy(Z)
+
+	cmi = H_xz + H_yz - H_xyz - H_z
+
+	return cmi
